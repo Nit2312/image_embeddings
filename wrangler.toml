@@ -1,0 +1,22 @@
+name = "image-vector-store-worker"
+main = "worker.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Vectorize binding
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "suratstock-images"
+
+# Environment variables (set via wrangler secret put or in dashboard)
+# These will be available in env.ACCOUNT_ID, env.API_TOKEN, etc.
+# You can also set them via: wrangler secret put ACCOUNT_ID
+# wrangler secret put API_TOKEN
+# wrangler secret put VECTORIZE_INDEX
+# wrangler secret put EMBEDDING_API_URL (optional)
+
+[env.production]
+name = "image-vector-store-worker"
+
+[env.development]
+name = "image-vector-store-worker-dev"

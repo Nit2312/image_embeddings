@@ -1,0 +1,14 @@
+node_modules/
+venv/
+.DS_Store
+.env
+pycache__/
+__pycache__/*.pyc
+
+# Data folder - contains downloaded images (not needed in repo)
+data/
+*.npy
+*.faiss
+image_index.faiss
+image_paths.npy
+image_embeddings.npy
