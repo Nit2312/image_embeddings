@@ -1,17 +1,5 @@
-# For image feature extraction and vector search
-faiss-cpu
-pillow
-torchvision
 fastapi
-python-multipart
 uvicorn
-matplotlib
+pillow
 numpy
-scikit-learn
-torch
 transformers
-# For R2 storage access
-boto3
-python-dotenv
-# For Cloudflare Vectorize API
-requests
