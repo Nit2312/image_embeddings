@@ -20,10 +20,28 @@ This implementation is built and tested with **Myntra’s fashion catalog datase
 - **Local layout**: images live under `data/` (flat or nested folders)
 - **Optional product grouping**: if you organize as `data/<product_id>/image.jpg`, the uploader stores `product_id` in Vectorize metadata
 
-## Architecture (high level)
+## Architecture
 
-- **Bulk ingestion**: `data/` → DINOv3 embeddings (Python) → Vectorize upsert (Cloudflare API)
-- **Query**: query image → embedding (Python FastAPI) → Vectorize query (Worker) → top matches (+ metadata)
+### Components
+
+- `upload_vectors_to_vectorize.py` (Python): reads local images under `data/`, generates DINOv3 embeddings, and upserts them into Vectorize via Cloudflare’s REST API.
+- `embedding_api.py` (Python/FastAPI): stateless HTTP service that turns an image into a 768-dim normalized embedding (used by the Worker at query-time and when adding vectors via the API).
+- `worker.ts` (Cloudflare Worker): thin API layer that validates requests, calls the embedding API, then uses the Vectorize binding to upsert/query/delete.
+- `web/` (React + Vite): UI for running searches and visualizing results.
+
+### Data flow
+
+- Ingestion (offline/batch): local image file → DINOv3 embedding → Vectorize `upsert` (REST API)
+- Search (online): query image (base64 or URL) → Worker → embedding API → Vectorize `query` → matches (ids + metadata + score)
+
+### IDs and metadata
+
+- Vector IDs are stable during bulk ingestion: the uploader uses `sha256(relative_path)[:32]`, so re-running ingestion is idempotent for the same dataset layout.
+- The uploader stores metadata per vector (used by the UI and for filtering), including:
+  - `relative_path`: path under `data/` (POSIX-style)
+  - `filename`
+  - `product_id` when your layout is `data/<product_id>/...`
+  - `source` (defaults to `catalog`)
 
 ## Repository structure
 
@@ -32,6 +50,7 @@ This implementation is built and tested with **Myntra’s fashion catalog datase
 - `embedding_api.py`: FastAPI image→embedding service (DINOv3)
 - `upload_vectors_to_vectorize.py`: bulk embed + upload from `data/` to Vectorize
 - `verify_vectorize_index.py`: sanity check / index inspection
+- `evaluate_retrieval.py`: retrieval metrics evaluation against `data/` structure
 - `web/`: React + TypeScript + MUI frontend (visual search UI)
 
 ## Prerequisites
@@ -42,17 +61,23 @@ This implementation is built and tested with **Myntra’s fashion catalog datase
 
 ## Configuration
 
-### 1) Local environment (`.env`)
+### Python scripts (`.env`)
 
 Copy `.env.example` → `.env` and fill in:
 
-- `DATA_FOLDER`: defaults to `data`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_VECTORIZE_INDEX`
 - `CLOUDFLARE_API_TOKEN`
+- `DATA_FOLDER`: defaults to `data`
 - `EMBED_BATCH_SIZE` / `UPLOAD_BATCH_SIZE`: tune for throughput vs request size limits
 
-### 2) Worker secrets (Wrangler)
+These variables are consumed by:
+
+- `upload_vectors_to_vectorize.py`
+- `verify_vectorize_index.py`
+- `evaluate_retrieval.py`
+
+### Worker secrets (Wrangler)
 
 Set secrets for the Worker (recommended instead of hardcoding):
 
@@ -65,8 +90,9 @@ wrangler secret put EMBEDDING_API_URL
 
 Notes:
 
+- `ACCOUNT_ID` / `API_TOKEN` / `VECTORIZE_INDEX` are Worker-only names (they are different from the Python script variables that start with `CLOUDFLARE_...`).
 - `EMBEDDING_API_URL` **must be publicly reachable** (the Worker cannot call `localhost`).
-- `wrangler.toml` defines the Vectorize binding name `VECTORIZE` and an `index_name`. Keep it consistent with the `VECTORIZE_INDEX` secret you use in the Worker.
+- `wrangler.toml` defines the Vectorize binding name `VECTORIZE` and an `index_name`; the Worker uses the binding for reads/writes, and also uses `VECTORIZE_INDEX` when calling the Cloudflare REST API in `/create-index`.
 
 ## Create a Vectorize index
 
@@ -100,6 +126,12 @@ data/
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+3) Create `.env`:
+
+```bash
+cp .env.example .env
 ```
 
 3) Upload vectors to Vectorize:
@@ -161,12 +193,30 @@ Available endpoints (see `worker.ts`):
 - `DELETE /delete-vector/:id`: delete a vector by id
 - `POST /search`: embed a query image and return top matches (default top 20)
 
-Example search request (JSON, base64 image):
+### API usage examples
+
+Search request (JSON, base64 image):
 
 ```bash
 curl -sS -X POST "$WORKER_URL/search" \
   -H "Content-Type: application/json" \
   -d '{"image":"data:image/jpeg;base64,<...>","topK":20}'
+```
+
+Search request (JSON, image URL):
+
+```bash
+curl -sS -X POST "$WORKER_URL/search" \
+  -H "Content-Type: application/json" \
+  -d '{"imageUrl":"https://example.com/image.jpg","topK":20}'
+```
+
+Add vector (multipart file upload):
+
+```bash
+curl -sS -X POST "$WORKER_URL/add-vector" \
+  -F "image=@/path/to/image.jpg" \
+  -F 'metadata={"source":"upload"}'
 ```
 
 ## Web UI (React / Vite)
@@ -195,6 +245,12 @@ The bulk uploader stores useful metadata alongside each vector, including:
 - `source` (e.g. `catalog`)
 
 The Worker also stores metadata for vectors added via `/add-vector` (e.g. `uploaded_at`, `source`).
+
+## Troubleshooting
+
+- `413 Payload Too Large` during ingestion: reduce `UPLOAD_BATCH_SIZE` in `.env` (try `1-3`).
+- Worker cannot use `localhost` embedding API: `EMBEDDING_API_URL` must be public; use a hosted service or a tunnel.
+- Slow first request to embedding API: DINOv3 model loads on startup; expect warm-up latency.
 
 ## Security & operational notes
 
