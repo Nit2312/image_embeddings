@@ -20,6 +20,9 @@ interface VectorMetadata {
   filename?: string;
   path?: string;
   uploaded_at?: string;
+  source?: string;
+  product_id?: string;
+  content_type?: string;
   [key: string]: any;
 }
 
@@ -96,8 +99,8 @@ export default {
     } catch (error: any) {
       console.error('Error:', error);
       return new Response(JSON.stringify({ 
+        success: false,
         error: error.message || 'Internal Server Error',
-        details: error.stack 
       }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -105,6 +108,21 @@ export default {
     }
   },
 };
+
+function json(
+  data: unknown,
+  corsHeaders: Record<string, string>,
+  status = 200
+): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+function badRequest(corsHeaders: Record<string, string>, message: string): Response {
+  return json({ success: false, error: message }, corsHeaders, 400);
+}
 
 /**
  * 1. Create/Generate Vector Store (Index)
@@ -119,21 +137,20 @@ async function handleCreateIndex(
     const { dimensions, metric = 'cosine', description } = body;
 
     if (!dimensions || dimensions < 1) {
-      return new Response(JSON.stringify({ error: 'dimensions is required and must be > 0' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      return badRequest(corsHeaders, 'dimensions is required and must be > 0');
     }
 
     // Validate environment variables
     if (!env.ACCOUNT_ID || !env.VECTORIZE_INDEX || !env.API_TOKEN) {
-      return new Response(JSON.stringify({ 
-        success: false,
-        error: 'Missing required environment variables. Please set ACCOUNT_ID, VECTORIZE_INDEX, and API_TOKEN secrets in your worker.' 
-      }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      return json(
+        {
+          success: false,
+          error:
+            'Missing required environment variables. Please set ACCOUNT_ID, VECTORIZE_INDEX, and API_TOKEN secrets in your worker.',
+        },
+        corsHeaders,
+        500
+      );
     }
 
     // Create index via Cloudflare API
@@ -181,27 +198,25 @@ async function handleCreateIndex(
     }
 
     if (response.ok && result.success) {
-      return new Response(JSON.stringify({
-        success: true,
-        message: 'Vector store created successfully',
-        index: result.result,
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    } else {
-      return new Response(JSON.stringify({
+      return json(
+        {
+          success: true,
+          message: 'Vector store created successfully',
+          index: result.result,
+        },
+        corsHeaders
+      );
+    }
+    return json(
+      {
         success: false,
         error: result.errors || 'Failed to create index',
-      }), {
-        status: response.status,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
+      },
+      corsHeaders,
+      response.status
+    );
   } catch (error: any) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return json({ success: false, error: error.message }, corsHeaders, 500);
   }
 }
 
@@ -228,10 +243,7 @@ async function handleAddVector(
       const metadataStr = formData.get('metadata') as string;
 
       if (!file) {
-        return new Response(JSON.stringify({ error: 'No image file provided' }), {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
+        return badRequest(corsHeaders, 'No image file provided');
       }
 
       imageBuffer = await file.arrayBuffer();
@@ -247,6 +259,7 @@ async function handleAddVector(
 
       metadata.filename = file.name;
       metadata.uploaded_at = new Date().toISOString();
+      metadata.source = metadata.source || 'upload';
     } else if (contentType.includes('application/json')) {
       // Handle JSON with base64 image or image URL
       const body = await request.json();
@@ -274,25 +287,23 @@ async function handleAddVector(
         }
         imageBuffer = await imageResponse.arrayBuffer();
       } else {
-        return new Response(JSON.stringify({ error: 'No image provided (use image or imageUrl)' }), {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
+        return badRequest(corsHeaders, 'No image provided (use image or imageUrl)');
       }
 
       if (customMetadata) {
         metadata = { ...metadata, ...customMetadata };
       }
       metadata.uploaded_at = new Date().toISOString();
+      metadata.source = metadata.source || (imageUrl ? 'url' : 'base64');
     } else {
-      return new Response(JSON.stringify({ error: 'Unsupported content type' }), {
-        status: 415,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      return json({ success: false, error: 'Unsupported content type' }, corsHeaders, 415);
     }
 
     // Convert image to vector
     const vector = await convertImageToVector(imageBuffer, env);
+    if (!Array.isArray(vector) || vector.length < 1) {
+      return json({ success: false, error: 'Embedding service returned an invalid vector' }, corsHeaders, 502);
+    }
 
     // Upsert into Vectorize
     const upsertResult = await env.VECTORIZE.upsert([{
@@ -301,19 +312,17 @@ async function handleAddVector(
       metadata,
     }]);
 
-    return new Response(JSON.stringify({
-      success: true,
-      id: vectorId,
-      mutationId: upsertResult.mutationId,
-      message: 'Vector added successfully',
-    }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return json(
+      {
+        success: true,
+        id: vectorId,
+        mutationId: upsertResult.mutationId,
+        message: 'Vector added successfully',
+      },
+      corsHeaders
+    );
   } catch (error: any) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return json({ success: false, error: error.message }, corsHeaders, 500);
   }
 }
 
@@ -327,136 +336,21 @@ async function handleDeleteVector(
 ): Promise<Response> {
   try {
     if (!id) {
-      return new Response(JSON.stringify({ error: 'Vector ID is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      return badRequest(corsHeaders, 'Vector ID is required');
     }
 
-    // Validate environment variables
-    if (!env.ACCOUNT_ID || !env.VECTORIZE_INDEX || !env.API_TOKEN) {
-      return new Response(JSON.stringify({ 
-        success: false,
-        error: 'Missing required environment variables. Please set ACCOUNT_ID, VECTORIZE_INDEX, and API_TOKEN secrets in your worker.' 
-      }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Cloudflare Vectorize delete endpoint
-    // Note: Vectorize API might use different endpoint format
-    const url = `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/vectorize/v2/indexes/${env.VECTORIZE_INDEX}/delete`;
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${env.API_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ids: [id],
-      }),
-    });
-
-    // Handle 404 - endpoint might not exist or Vectorize doesn't support delete
-    if (response.status === 404) {
-      return new Response(JSON.stringify({
-        success: false,
-        error: 'Delete endpoint not found. Cloudflare Vectorize may not support deleting individual vectors via API. Consider using the Vectorize binding or recreating the index without the vector.',
-        statusCode: 404,
-        note: 'Vectorize delete functionality may require using wrangler CLI or may not be available via API',
-      }), {
-        status: 404,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Check if response is JSON before parsing
-    const contentType = response.headers.get('content-type') || '';
-    let result: any;
-    
-    if (contentType.includes('application/json')) {
-      try {
-        const text = await response.text();
-        result = JSON.parse(text.trim());
-      } catch (parseError: any) {
-        // If JSON parsing fails, get text response
-        const text = await response.text();
-        return new Response(JSON.stringify({
-          success: false,
-          error: `Invalid JSON response: ${text.substring(0, 200)}`,
-          statusCode: response.status,
-        }), {
-          status: response.status,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-    } else {
-      // Response is not JSON, get text
-      const text = await response.text();
-      return new Response(JSON.stringify({
-        success: false,
-        error: `Unexpected response format (${response.status}): ${text.substring(0, 200)}`,
-        statusCode: response.status,
-      }), {
-        status: response.status,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    if (response.ok && result.success) {
-      return new Response(JSON.stringify({
+    const mutation = await env.VECTORIZE.deleteByIds([id]);
+    return json(
+      {
         success: true,
-        message: 'Vector deleted successfully',
         id,
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    } else {
-      // Extract error message properly with more details
-      let errorMsg = 'Failed to delete vector';
-      
-      if (response.status === 401 || response.status === 403) {
-        errorMsg = 'Authentication failed. Please check your API_TOKEN. Make sure it has Vectorize permissions and is not expired.';
-      } else if (result.errors && Array.isArray(result.errors)) {
-        errorMsg = result.errors.map((e: any) => {
-          if (e.message) return e.message;
-          if (e.code) return `Error ${e.code}: ${e.message || 'Unknown error'}`;
-          return JSON.stringify(e);
-        }).join(', ');
-      } else if (result.error) {
-        errorMsg = typeof result.error === 'string' ? result.error : JSON.stringify(result.error);
-      } else if (result.message) {
-        errorMsg = result.message;
-      }
-      
-      // Add status code info
-      if (response.status === 401) {
-        errorMsg = `Authentication failed (401): ${errorMsg}. Please verify your API_TOKEN has Vectorize:Edit permissions.`;
-      } else if (response.status === 403) {
-        errorMsg = `Permission denied (403): ${errorMsg}. Your API_TOKEN may not have the required permissions.`;
-      } else if (response.status === 404) {
-        errorMsg = `Not found (404): ${errorMsg}. Check if the index name '${env.VECTORIZE_INDEX}' is correct.`;
-      }
-      
-      return new Response(JSON.stringify({
-        success: false,
-        error: errorMsg,
-        statusCode: response.status,
-      }), {
-        status: response.status,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
+        mutationId: mutation.mutationId,
+        message: 'Vector delete requested',
+      },
+      corsHeaders
+    );
   } catch (error: any) {
-    return new Response(JSON.stringify({ 
-      success: false,
-      error: error.message || 'Internal server error' 
-    }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return json({ success: false, error: error.message || 'Internal server error' }, corsHeaders, 500);
   }
 }
 
@@ -469,7 +363,6 @@ async function handleSearch(
   corsHeaders: Record<string, string>
 ): Promise<Response> {
   try {
-    const contentType = request.headers.get('content-type') || '';
     const body: SearchRequest = await request.json();
 
     let imageBuffer: ArrayBuffer;
@@ -494,14 +387,14 @@ async function handleSearch(
       }
       imageBuffer = await imageResponse.arrayBuffer();
     } else {
-      return new Response(JSON.stringify({ error: 'No image provided (use image or imageUrl)' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      return badRequest(corsHeaders, 'No image provided (use image or imageUrl)');
     }
 
     // Convert image to vector
     const queryVector = await convertImageToVector(imageBuffer, env);
+    if (!Array.isArray(queryVector) || queryVector.length < 1) {
+      return json({ success: false, error: 'Embedding service returned an invalid vector' }, corsHeaders, 502);
+    }
 
     // Perform similarity search
     const topK = body.topK || 20;
@@ -512,18 +405,16 @@ async function handleSearch(
       filter: body.filter,
     });
 
-    return new Response(JSON.stringify({
-      success: true,
-      matches: matches.matches || [],
-      count: matches.matches?.length || 0,
-    }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return json(
+      {
+        success: true,
+        matches: matches.matches || [],
+        count: matches.matches?.length || 0,
+      },
+      corsHeaders
+    );
   } catch (error: any) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return json({ success: false, error: error.message }, corsHeaders, 500);
   }
 }
 

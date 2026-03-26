@@ -6,9 +6,20 @@ pycache__/
 __pycache__/*.pyc
 
 # Data folder - contains downloaded images (not needed in repo)
+archive/
 data/
 *.npy
 *.faiss
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+*.ico
+*.svg
+*.tiff
+*.tif
 image_index.faiss
 image_paths.npy
 image_embeddings.npy

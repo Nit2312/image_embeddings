@@ -4,3 +4,9 @@ pillow
 numpy
 transformers
 torch
+torchvision
+python-dotenv
+requests
+faiss-cpu
+python-multipart
+ngrok

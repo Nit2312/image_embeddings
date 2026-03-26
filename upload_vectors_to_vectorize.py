@@ -1,11 +1,12 @@
 """
 Script to convert images to vectors using DINOv3 model and upload to Cloudflare Vectorize.
 
+Data source: put images under the `data/` folder (flat or nested subfolders). That folder is the only source.
+
 Prerequisites:
-1. Ensure images are downloaded to the 'data' folder using download_images_from_r2.py
-2. Create a Cloudflare Vectorize index with 768 dimensions and cosine metric:
+1. Create a Cloudflare Vectorize index with 768 dimensions and cosine metric:
    npx wrangler vectorize create <index-name> --dimensions=768 --metric=cosine
-3. Set the following in your .env file:
+2. Set the following in your .env file:
    - CLOUDFLARE_ACCOUNT_ID
    - CLOUDFLARE_VECTORIZE_INDEX
    - CLOUDFLARE_API_TOKEN
@@ -13,6 +14,7 @@ Prerequisites:
 import os
 import json
 import hashlib
+import math
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -21,6 +23,7 @@ from transformers import pipeline
 from dotenv import load_dotenv
 import requests
 import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,10 +34,13 @@ CLOUDFLARE_VECTORIZE_INDEX = os.getenv("CLOUDFLARE_VECTORIZE_INDEX")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 
 # Image processing configuration
-DATA_FOLDER = "data"
+DATA_FOLDER = os.getenv("DATA_FOLDER", "data")
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 VECTOR_DIM = 768  # DINOv3 ViT-B/16 produces 768-dimensional embeddings
-BATCH_SIZE = 50  # Number of vectors to upload per API call
+UPLOAD_BATCH_SIZE = int(os.getenv("UPLOAD_BATCH_SIZE", "5"))  # vectors per API call (keep small to avoid 413)
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "8"))  # model inference batch size
+MAX_IMAGES = os.getenv("MAX_IMAGES")
+START_AT = int(os.getenv("START_AT", "0"))
 
 # Image extensions to process
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
@@ -65,184 +71,199 @@ def is_thumbnail(key, filename):
     return False
 
 
-def generate_vector_id(image_path):
-    """Generate a unique ID for the vector based on image path."""
-    # Use hash of the full path to ensure uniqueness
-    path_str = str(image_path.resolve())
-    return hashlib.sha256(path_str.encode()).hexdigest()[:32]
+def _stable_id_from_string(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:32]
 
 
-def load_images_from_folder(folder):
-    """Load all images from the specified folder."""
-    images = []
-    paths = []
-    folder_path = Path(folder)
-    
-    if not folder_path.exists():
-        raise ValueError(f"Data folder '{folder}' does not exist. Please download images first.")
-    
-    for file_path in folder_path.iterdir():
+def _product_id_from_relative_path(relative_posix: str) -> Optional[str]:
+    """If images live under data/<segment>/..., use first segment as product_id."""
+    parts = [p for p in relative_posix.split("/") if p]
+    if len(parts) >= 2:
+        return parts[0]
+    return None
+
+
+def _iter_local_images(data_folder: Path) -> Iterable[Tuple[Path, Dict[str, Any]]]:
+    """
+    Walk `data/` recursively. Vector id is stable per relative path.
+    """
+    for file_path in sorted(data_folder.rglob("*")):
         if not file_path.is_file():
             continue
-        
+        if file_path.name == "manifest.jsonl":
+            continue
+
         filename = file_path.name
-        key = str(file_path)
-        
-        # Skip if not an image file
         if not is_image_file(filename):
             continue
-        
-        # Skip thumbnails
-        if is_thumbnail(key, filename):
+        rel = file_path.relative_to(data_folder)
+        rel_posix = rel.as_posix()
+        if is_thumbnail(rel_posix, filename):
             continue
-        
-        try:
-            img = Image.open(file_path).convert("RGB")
-            images.append(img)
-            paths.append(file_path)
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            continue
-    
-    return images, paths
+
+        vector_id = _stable_id_from_string(rel_posix)
+        product_id = _product_id_from_relative_path(rel_posix)
+        metadata: Dict[str, Any] = {
+            "filename": filename,
+            "local_filename": filename,
+            "relative_path": rel_posix,
+            "source": "catalog",
+        }
+        if product_id is not None:
+            metadata["product_id"] = product_id
+
+        yield file_path, {"id": vector_id, "metadata": metadata}
 
 
-def extract_embeddings(images, paths):
-    """Extract embeddings from images using DINOv3 model."""
-    print("Loading DINOv3 model...")
-    pipe = pipeline("image-feature-extraction", model=DINO_MODEL)
-    
-    print(f"Extracting embeddings from {len(images)} images...")
-    embeddings = []
-    vector_ids = []
-    metadata_list = []
-    
-    for i, (img, path) in enumerate(zip(images, paths)):
-        try:
-            # Extract features using the pipeline
-            vec = pipe(img)
-            # Pool the features (mean pooling)
-            pooled_vec = np.mean(np.array(vec[0]), axis=0)
-            # Normalize the embedding to unit length
-            pooled_vec = pooled_vec / (norm(pooled_vec) + 1e-10)
-            
-            # Convert to list for JSON serialization
-            embedding = pooled_vec.tolist()
-            
-            # Generate unique ID
-            vector_id = generate_vector_id(path)
-            
-            # Prepare metadata
-            metadata = {
-                "filename": path.name,
-                "path": str(path),
-                "relative_path": str(path.relative_to(Path(DATA_FOLDER)))
-            }
-            
-            embeddings.append(embedding)
-            vector_ids.append(vector_id)
-            metadata_list.append(metadata)
-            
-            if (i + 1) % 100 == 0:
-                print(f"Processed {i + 1}/{len(images)} images...")
-                
-        except Exception as e:
-            print(f"Error processing {path}: {e}")
-            continue
-    
-    print(f"Successfully extracted {len(embeddings)} embeddings")
-    return vector_ids, embeddings, metadata_list
+def _extract_embeddings(pipe, images: List[Image.Image]) -> List[List[float]]:
+    """
+    Extract normalized embeddings for a batch of images.
+    Returns list of python lists (JSON serializable).
+    """
+    vecs = pipe(images, batch_size=EMBED_BATCH_SIZE)
+    out: List[List[float]] = []
+    for v in vecs:
+        arr = np.array(v)
+        # Some pipelines return shape (1, seq_len, dim) per image; normalize to (seq_len, dim)
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        pooled = np.mean(arr, axis=0)
+        pooled = pooled / (norm(pooled) + 1e-10)
+        out.append(pooled.astype("float32").tolist())
+    return out
 
 
-def upload_vectors_to_vectorize(vector_ids, embeddings, metadata_list):
-    """Upload vectors to Cloudflare Vectorize."""
+def _vectorize_upsert_url() -> str:
     # Validate environment variables
     if not all([CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_VECTORIZE_INDEX, CLOUDFLARE_API_TOKEN]):
         raise ValueError("Missing required Cloudflare Vectorize environment variables. Please check your .env file.")
-    
-    # Cloudflare Vectorize API endpoint (v2 API)
-    # Using upsert instead of insert to handle existing vectors
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/vectorize/v2/indexes/{CLOUDFLARE_VECTORIZE_INDEX}/upsert"
-    
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    total_vectors = len(vector_ids)
+    return f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/vectorize/v2/indexes/{CLOUDFLARE_VECTORIZE_INDEX}/upsert"
+
+
+def _vectorize_headers() -> Dict[str, str]:
+    if not CLOUDFLARE_API_TOKEN:
+        raise ValueError("Missing CLOUDFLARE_API_TOKEN")
+    return {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"}
+
+
+def embed_and_upload_from_folder(data_folder: str) -> None:
+    """
+    Stream embeddings from local `data/` and upload in batches.
+    This avoids holding all embeddings in memory (important for large datasets).
+    """
+    folder_path = Path(data_folder)
+    if not folder_path.exists():
+        raise ValueError(f"Data folder '{data_folder}' does not exist. Add images under {data_folder}/ first.")
+
+    max_images: Optional[int] = None
+    if MAX_IMAGES:
+        try:
+            max_images = int(MAX_IMAGES)
+        except ValueError:
+            raise ValueError("MAX_IMAGES must be an integer if set")
+
+    url = _vectorize_upsert_url()
+    headers = _vectorize_headers()
+
+    print("Loading DINOv3 model...")
+    pipe = pipeline("image-feature-extraction", model=DINO_MODEL)
+
     uploaded_count = 0
     failed_count = 0
-    
-    print(f"Uploading {total_vectors} vectors to Cloudflare Vectorize...")
-    print(f"Index: {CLOUDFLARE_VECTORIZE_INDEX}")
-    print("-" * 50)
-    
-    # Upload in batches
-    for i in range(0, total_vectors, BATCH_SIZE):
-        batch_ids = vector_ids[i:i + BATCH_SIZE]
-        batch_embeddings = embeddings[i:i + BATCH_SIZE]
-        batch_metadata = metadata_list[i:i + BATCH_SIZE]
-        
-        # Prepare vectors for this batch
-        vectors = []
-        for vec_id, embedding, metadata in zip(batch_ids, batch_embeddings, batch_metadata):
-            vector = {
-                "id": vec_id,
-                "values": embedding,
-                "metadata": metadata
-            }
-            vectors.append(vector)
-        
-        # Prepare request body
-        payload = {
-            "vectors": vectors
-        }
-        
+    seen = 0
+
+    upload_vectors: List[Dict[str, Any]] = []
+    embed_imgs: List[Image.Image] = []
+    embed_infos: List[Dict[str, Any]] = []
+
+    def flush_embed_to_upload():
+        nonlocal embed_imgs, embed_infos, upload_vectors
+        if not embed_imgs:
+            return
+        embeddings = _extract_embeddings(pipe, embed_imgs)
+        for info, emb in zip(embed_infos, embeddings):
+            if not emb or any((not isinstance(x, (int, float)) or not math.isfinite(float(x))) for x in emb):
+                # Skip vectors with NaN/Inf (Cloudflare rejects non-JSON numbers)
+                # Count as failed so totals still reflect reality.
+                nonlocal failed_count
+                failed_count += 1
+                continue
+            upload_vectors.append({"id": info["id"], "values": emb, "metadata": info["metadata"]})
+        embed_imgs = []
+        embed_infos = []
+
+    def flush_upload():
+        nonlocal upload_vectors, uploaded_count, failed_count
+        if not upload_vectors:
+            return
+        payload = {"vectors": upload_vectors}
         try:
-            response = requests.post(url, headers=headers, json=payload)
-            
-            # Print response for debugging (first batch only)
-            if i == 0:
-                print(f"API Response Status: {response.status_code}")
-                print(f"API Response: {response.text[:500]}...")  # First 500 chars
-            
+            body = json.dumps(payload, allow_nan=False)
+            response = requests.post(url, headers=headers, data=body)
             if response.status_code == 200:
                 result = response.json()
                 if result.get("success", False):
-                    uploaded_count += len(vectors)
-                    # Print result details for first batch
-                    if i == 0:
-                        print(f"Success response: {json.dumps(result, indent=2)[:500]}")
-                    print(f"[{uploaded_count}/{total_vectors}] Uploaded batch of {len(vectors)} vectors")
+                    uploaded_count += len(upload_vectors)
+                    print(f"Uploaded {uploaded_count} vectors...")
                 else:
-                    errors = result.get("errors", [])
-                    print(f"Error uploading batch: {errors}")
-                    print(f"Full response: {json.dumps(result, indent=2)}")
-                    failed_count += len(vectors)
+                    failed_count += len(upload_vectors)
+                    print(f"Vectorize error: {result.get('errors')}")
             else:
-                print(f"HTTP {response.status_code} error uploading batch: {response.text}")
-                failed_count += len(vectors)
-            
-            # Rate limiting: add a small delay between batches
-            time.sleep(0.1)
-            
+                failed_count += len(upload_vectors)
+                print(f"HTTP {response.status_code} error uploading batch: {response.text[:500]}")
+                if response.status_code == 413:
+                    print(
+                        "Tip: reduce UPLOAD_BATCH_SIZE (e.g. 1-3). "
+                        "Each vector is 768 floats; JSON payloads can exceed Cloudflare limits quickly."
+                    )
+                if response.status_code == 400:
+                    # Print a tiny sample to help debug schema issues without dumping massive payloads
+                    sample = upload_vectors[0]
+                    print(f"Sample vector id={sample.get('id')} values_len={len(sample.get('values', []))} metadata_keys={list((sample.get('metadata') or {}).keys())}")
+        except ValueError as e:
+            # allow_nan=False will throw if any NaN/Inf sneaks in
+            failed_count += len(upload_vectors)
+            print(f"JSON serialization error (likely NaN/Inf in values): {e}")
         except Exception as e:
+            failed_count += len(upload_vectors)
             print(f"Exception uploading batch: {e}")
-            import traceback
-            traceback.print_exc()
-            failed_count += len(vectors)
+        finally:
+            upload_vectors = []
+            time.sleep(0.1)
+
+    for idx, (path, info) in enumerate(_iter_local_images(folder_path)):
+        if idx < START_AT:
             continue
-    
+        if max_images is not None and seen >= max_images:
+            break
+
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+
+        embed_imgs.append(img)
+        embed_infos.append(info)
+        seen += 1
+
+        if seen % 200 == 0:
+            print(f"Prepared {seen} images...")
+
+        if len(embed_imgs) >= EMBED_BATCH_SIZE:
+            flush_embed_to_upload()
+
+        if len(upload_vectors) >= UPLOAD_BATCH_SIZE:
+            flush_upload()
+
+    flush_embed_to_upload()
+    flush_upload()
+
     print("-" * 50)
-    print(f"Upload complete!")
+    print("Upload complete!")
     print(f"Successfully uploaded: {uploaded_count} vectors")
     print(f"Failed: {failed_count} vectors")
     print(f"Index: {CLOUDFLARE_VECTORIZE_INDEX}")
-    
-    # Verify vectors were inserted
-    if uploaded_count > 0:
-        print("\nVerifying vectors in index...")
-        verify_vectors_in_index()
 
 
 def verify_vectors_in_index():
@@ -287,31 +308,14 @@ def verify_vectors_in_index():
 def main():
     """Main function to process images and upload to Vectorize."""
     try:
-        # Load images
-        print("Loading images from data folder...")
-        images, paths = load_images_from_folder(DATA_FOLDER)
-        
-        if not images:
-            print("No images found in data folder. Please download images first.")
-            return
-        
-        print(f"Found {len(images)} images to process")
-        print("-" * 50)
-        
-        # Extract embeddings
-        vector_ids, embeddings, metadata_list = extract_embeddings(images, paths)
-        
-        if not embeddings:
-            print("No embeddings extracted. Exiting.")
-            return
-        
-        # Verify embedding dimensions
-        if len(embeddings[0]) != VECTOR_DIM:
-            print(f"Warning: Embedding dimension is {len(embeddings[0])}, expected {VECTOR_DIM}")
-            print("Please ensure your Vectorize index is created with the correct dimensions.")
-        
-        # Upload to Cloudflare Vectorize
-        upload_vectors_to_vectorize(vector_ids, embeddings, metadata_list)
+        print(f"Reading images from {DATA_FOLDER}/ ...")
+        print(f"Embedding batch size: {EMBED_BATCH_SIZE} | Upload batch size: {UPLOAD_BATCH_SIZE}")
+        if MAX_IMAGES:
+            print(f"MAX_IMAGES={MAX_IMAGES}")
+        if START_AT:
+            print(f"START_AT={START_AT}")
+
+        embed_and_upload_from_folder(DATA_FOLDER)
         
     except Exception as e:
         print(f"Error: {e}")
